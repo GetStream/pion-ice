@@ -781,6 +781,7 @@ func (a *Agent) setSelectedPair(pair *CandidatePair) {
 		var nilPair *CandidatePair
 		a.selectedPair.Store(nilPair)
 		a.log.Tracef("Unset selected candidate pair")
+		a.spedPairsReset()
 
 		return
 	}
@@ -1956,7 +1957,7 @@ func (a *Agent) handleInboundRequest(
 		return nil, false
 	}
 
-	a.handleSPEDRequest(msg, remoteCandidate)
+	a.handleSPEDRequest(msg, local, remoteCandidate)
 
 	a.getSelector().HandleBindingRequest(msg, local, remoteCandidate)
 

@@ -195,7 +195,7 @@ func (s *controllingSelector) HandleSuccessResponse(
 		return
 	}
 
-	s.agent.handleSPEDResponse(message, pendingRequest, remote)
+	s.agent.handleSPEDResponse(message, pendingRequest, pair)
 
 	pair.state = CandidatePairStateSucceeded
 	s.log.Tracef("Found valid candidate pair: %s", pair)
@@ -434,7 +434,7 @@ func (s *controlledSelector) HandleSuccessResponse(
 		return
 	}
 
-	s.agent.handleSPEDResponse(message, pendingRequest, remote)
+	s.agent.handleSPEDResponse(message, pendingRequest, pair)
 
 	pair.state = CandidatePairStateSucceeded
 	s.log.Tracef("Found valid candidate pair: %s", pair)

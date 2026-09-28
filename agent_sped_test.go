@@ -791,3 +791,98 @@ func TestSPEDRequestRecordsSentAttributes(t *testing.T) {
 		require.Equal(t, crc32.ChecksumIEEE(spedFlight1), request.spedDataCRC)
 	})
 }
+
+func TestSPEDWriteDTLS(t *testing.T) {
+	t.Run("LiteAfterAuthenticatedRequest", func(t *testing.T) {
+		env := newSPEDTestEnv(t, spedTestConfig{lite: true})
+		_, err := env.agent.WriteDTLS(spedFlight2)
+		require.ErrorIs(t, err, ErrNoCandidatePairs)
+
+		// The DTLS server answers the ClientHello from the callback: directly,
+		// then in the response.
+		env.agent.SetDTLSCallback(func([]byte, net.Addr) {
+			require.True(t, env.agent.Piggyback([][]byte{spedFlight2}))
+			n, err := env.agent.WriteDTLS(spedFlight2)
+			require.NoError(t, err)
+			require.Len(t, spedFlight2, n)
+		})
+		env.deliverRequest(t, DtlsInStunAckAttribute{}, DtlsInStunAttribute(spedFlight1))
+		require.Nil(t, env.agent.getSelectedPair())
+
+		written := env.conn.take()
+		require.Len(t, written, 2)
+		require.Equal(t, spedFlight2, written[0])
+		response := &stun.Message{Raw: written[1]}
+		require.NoError(t, response.Decode())
+		require.Equal(t, spedFlight2, spedAttributesFrom(response).data)
+	})
+
+	t.Run("LiteNotAfterFallback", func(t *testing.T) {
+		env := newSPEDTestEnv(t, spedTestConfig{lite: true})
+		env.deliverRequest(t)
+		require.Equal(t, SPEDStateOff, env.agent.SPEDState())
+
+		_, err := env.agent.WriteDTLS(spedFlight2)
+		require.ErrorIs(t, err, ErrNoCandidatePairs)
+	})
+
+	t.Run("FullAfterSuccessResponse", func(t *testing.T) {
+		env := newSPEDTestEnv(t, spedTestConfig{controlling: true})
+		_, err := env.agent.WriteDTLS(spedFlight1)
+		require.ErrorIs(t, err, ErrNoCandidatePairs)
+
+		env.deliverResponse(t, env.ping(t), DtlsInStunAckAttribute{})
+		env.conn.take()
+		_, err = env.agent.WriteDTLS(spedFlight1)
+		require.NoError(t, err)
+		require.Equal(t, [][]byte{spedFlight1}, env.conn.take())
+	})
+
+	t.Run("SelectedPair", func(t *testing.T) {
+		env := newSPEDTestEnv(t, spedTestConfig{controlling: true, disabled: true})
+		env.run(t, func() { env.agent.setSelectedPair(env.agent.findPair(env.local, env.remote)) })
+		env.conn.take()
+
+		_, err := env.agent.WriteDTLS(spedFlight1)
+		require.NoError(t, err)
+		require.Equal(t, [][]byte{spedFlight1}, env.conn.take())
+	})
+
+	t.Run("ForgottenWhenPairsDropped", func(t *testing.T) {
+		env := newSPEDTestEnv(t, spedTestConfig{lite: true})
+		env.deliverRequest(t, DtlsInStunAckAttribute{})
+		_, err := env.agent.WriteDTLS(spedFlight2)
+		require.NoError(t, err)
+
+		env.run(t, func() { env.agent.setSelectedPair(nil) })
+		_, err = env.agent.WriteDTLS(spedFlight2)
+		require.ErrorIs(t, err, ErrNoCandidatePairs)
+	})
+
+	t.Run("RejectsSTUN", func(t *testing.T) {
+		env := newSPEDTestEnv(t, spedTestConfig{controlling: true})
+		_, err := env.agent.WriteDTLS(env.ping(t).Raw)
+		require.ErrorIs(t, err, errWriteSTUNMessageToIceConn)
+	})
+
+	t.Run("Closed", func(t *testing.T) {
+		agent, err := NewAgent(&AgentConfig{})
+		require.NoError(t, err)
+		require.NoError(t, agent.Close())
+		_, err = agent.WriteDTLS(spedFlight1)
+		require.ErrorIs(t, err, ErrClosed)
+	})
+
+	t.Run("CompleteFlushesOnUsablePair", func(t *testing.T) {
+		env := newSPEDTestEnv(t, spedTestConfig{lite: true})
+		env.deliverRequest(t, DtlsInStunAckAttribute{})
+		env.conn.take()
+
+		require.True(t, env.agent.Piggyback([][]byte{spedFlight4}))
+		env.agent.SetDTLSHandshakeComplete()
+		env.agent.ApplicationDataReceived()
+		require.Equal(t, SPEDStateComplete, env.agent.SPEDState())
+		require.Nil(t, env.agent.getSelectedPair())
+		require.Equal(t, [][]byte{spedFlight4}, env.conn.take())
+	})
+}

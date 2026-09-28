@@ -18,6 +18,10 @@ type spedSession struct {
 	mu       sync.Mutex
 	ctrl     spedController
 	callback func(packet []byte, rAddr net.Addr)
+	// pair is where DTLS can be written directly before a pair is selected:
+	// the best pair that answered a check (full agent) or sent an
+	// authenticated check (lite agent) while SPED was active.
+	pair *CandidatePair
 	// state mirrors ctrl.state for reads without the lock.
 	state atomic.Int32
 }
@@ -96,6 +100,10 @@ func (a *Agent) SetDTLSCallback(callback func(packet []byte, rAddr net.Addr)) {
 // When SPED is complete or off and no pair is selected yet, the flight is held
 // and sent directly on the pair that gets selected.
 //
+// While SPED is active the caller should also write the flight with
+// WriteDTLS, which succeeds once a pair is usable: the peer then gets it
+// directly as well as in STUN, as libwebrtc does.
+//
 // It may be called from the DTLS callback.
 func (a *Agent) Piggyback(flight [][]byte) bool {
 	a.sped.mu.Lock()
@@ -156,6 +164,42 @@ func (a *Agent) ApplicationDataReceived() {
 	a.sped.mu.Unlock()
 
 	a.spedSend(pair, packets)
+}
+
+// WriteDTLS writes one DTLS datagram directly, outside STUN. It uses the
+// selected pair or, before a pair is selected and while the peer is known to
+// support SPED (SPEDStateConfirmed, SPEDStatePending or SPEDStateComplete),
+// the best pair that proved usable:
+//   - for a full agent, a pair that answered a check;
+//   - for a lite agent, a pair from which an authenticated check arrived. A
+//     lite agent otherwise cannot send before the peer nominates a pair.
+//
+// It returns ErrNoCandidatePairs when there is no such pair; the datagram is
+// then only delivered through STUN. Unlike Conn.Write it never waits for the
+// agent's loop, so it may be called from the DTLS callback, and it does not
+// count the bytes in Conn.BytesSent.
+func (a *Agent) WriteDTLS(packet []byte) (int, error) {
+	if err := a.loop.Err(); err != nil {
+		return 0, err
+	}
+	if stun.IsMessage(packet) {
+		return 0, errWriteSTUNMessageToIceConn
+	}
+
+	pair := a.getSelectedPair()
+	if pair == nil {
+		pair = a.spedDirectPair()
+	}
+	if pair == nil {
+		return 0, ErrNoCandidatePairs
+	}
+
+	n, err := pair.Write(packet)
+	if n > 0 {
+		pair.UpdatePacketSent(n)
+	}
+
+	return n, err
 }
 
 // SetDTLSFailed reports that the DTLS handshake failed. SPED turns off and the
@@ -245,17 +289,30 @@ func (a *Agent) spedRequestSent(msg *stun.Message, request *bindingRequest) {
 // handleSPEDRequest processes the SPED attributes of an authenticated Binding
 // request. It runs before the response is built, so that a flight queued by
 // the DTLS callback rides the response.
-func (a *Agent) handleSPEDRequest(msg *stun.Message, remote Candidate) {
+func (a *Agent) handleSPEDRequest(msg *stun.Message, local, remote Candidate) {
 	if !a.spedActive() {
 		return
+	}
+	if a.lite && !a.isControlling.Load() {
+		// The controlled selector adds the pair for this request anyway;
+		// adding it here lets DTLS produced by the callback go out directly.
+		pair := a.findPair(local, remote)
+		if pair == nil {
+			pair = a.addPair(local, remote)
+		}
+		a.spedPairUsable(pair)
 	}
 	a.receiveSPED(spedAttributesFrom(msg), remote)
 }
 
 // handleSPEDResponse processes the SPED attributes of a Binding success
 // response, if its request carried SPED attributes.
-func (a *Agent) handleSPEDResponse(msg *stun.Message, request *bindingRequest, remote Candidate) {
-	if !request.spedSent || !a.spedActive() {
+func (a *Agent) handleSPEDResponse(msg *stun.Message, request *bindingRequest, pair *CandidatePair) {
+	if !a.spedActive() {
+		return
+	}
+	a.spedPairUsable(pair)
+	if !request.spedSent {
 		return
 	}
 	attrs := spedAttributesFrom(msg)
@@ -265,7 +322,42 @@ func (a *Agent) handleSPEDResponse(msg *stun.Message, request *bindingRequest, r
 		attrs.acks = append(attrs.acks, request.spedDataCRC)
 		attrs.ackValid = true
 	}
-	a.receiveSPED(attrs, remote)
+	a.receiveSPED(attrs, pair.Remote)
+}
+
+// spedPairUsable records that DTLS may be written directly on pair before a
+// pair is selected, if it is better than the current one.
+func (a *Agent) spedPairUsable(pair *CandidatePair) {
+	a.sped.mu.Lock()
+	defer a.sped.mu.Unlock()
+	if a.sped.pair == nil || a.sped.pair.priority() < pair.priority() {
+		a.sped.pair = pair
+	}
+}
+
+// spedPairsReset forgets the usable pair when the agent drops its pairs.
+func (a *Agent) spedPairsReset() {
+	a.sped.mu.Lock()
+	defer a.sped.mu.Unlock()
+	a.sped.pair = nil
+}
+
+// spedDirectPair returns the usable pair while the peer is known to support
+// SPED, or nil.
+func (a *Agent) spedDirectPair() *CandidatePair {
+	a.sped.mu.Lock()
+	defer a.sped.mu.Unlock()
+
+	return a.spedDirectPairLocked()
+}
+
+func (a *Agent) spedDirectPairLocked() *CandidatePair {
+	switch a.sped.ctrl.state {
+	case SPEDStateConfirmed, SPEDStatePending, SPEDStateComplete:
+		return a.sped.pair
+	default:
+		return nil
+	}
 }
 
 // receiveSPED runs the controller on the SPED attributes of a message, hands
@@ -313,13 +405,18 @@ func (a *Agent) spedPairSelected() {
 
 // spedTakeFlushLocked returns the datagrams still pending after SPED completed
 // or turned off, and the pair to send them on directly. It returns nothing
-// while SPED is active or while no pair can carry them yet.
+// while SPED is active or while no pair can carry them yet. After a fallback
+// the datagrams wait for a selected pair: a peer without SPED only starts DTLS
+// once ICE connects.
 func (a *Agent) spedTakeFlushLocked() (*CandidatePair, []spedPacket) {
 	state := a.sped.ctrl.state
 	if (state != SPEDStateComplete && state != SPEDStateOff) || len(a.sped.ctrl.pending) == 0 {
 		return nil, nil
 	}
 	pair := a.getSelectedPair()
+	if pair == nil {
+		pair = a.spedDirectPairLocked()
+	}
 	if pair == nil {
 		return nil, nil
 	}
