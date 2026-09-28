@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -300,6 +301,7 @@ func (a *Agent) handleSPEDRequest(msg *stun.Message, local, remote Candidate) bo
 	if !a.spedActive() {
 		return false
 	}
+	var usable *CandidatePair
 	if a.lite && !a.isControlling.Load() {
 		// The controlled selector adds the pair for this request anyway;
 		// adding it here lets DTLS produced by the callback go out directly.
@@ -307,9 +309,11 @@ func (a *Agent) handleSPEDRequest(msg *stun.Message, local, remote Candidate) bo
 		if pair == nil {
 			pair = a.addPair(local, remote)
 		}
-		a.spedPairUsable(pair)
+		if a.spedPairUsable(pair) {
+			usable = pair
+		}
 	}
-	_, evaluate := a.receiveSPED(spedAttributesFrom(msg), remote)
+	_, evaluate := a.receiveSPED(spedAttributesFrom(msg), remote, usable)
 
 	return evaluate
 }
@@ -320,7 +324,10 @@ func (a *Agent) handleSPEDResponse(msg *stun.Message, request *bindingRequest, p
 	if !a.spedActive() {
 		return
 	}
-	a.spedPairUsable(pair)
+	var usable *CandidatePair
+	if a.spedPairUsable(pair) {
+		usable = pair
+	}
 	if !request.spedSent {
 		return
 	}
@@ -331,7 +338,7 @@ func (a *Agent) handleSPEDResponse(msg *stun.Message, request *bindingRequest, p
 		attrs.acks = append(attrs.acks, request.spedDataCRC)
 		attrs.ackValid = true
 	}
-	delivered, evaluate := a.receiveSPED(attrs, pair.Remote)
+	delivered, evaluate := a.receiveSPED(attrs, pair.Remote, usable)
 	if evaluate {
 		a.spedEvaluateCompletion()
 	}
@@ -351,13 +358,17 @@ func (a *Agent) spedRequestHandled(evaluate bool) {
 }
 
 // spedPairUsable records that DTLS may be written directly on pair before a
-// pair is selected, if it is better than the current one.
-func (a *Agent) spedPairUsable(pair *CandidatePair) {
+// pair is selected, if it is better than the current one. It reports whether
+// pair is the first usable pair.
+func (a *Agent) spedPairUsable(pair *CandidatePair) bool {
 	a.sped.mu.Lock()
 	defer a.sped.mu.Unlock()
-	if a.sped.pair == nil || a.sped.pair.priority() < pair.priority() {
+	first := a.sped.pair == nil
+	if first || a.sped.pair.priority() < pair.priority() {
 		a.sped.pair = pair
 	}
+
+	return first
 }
 
 // spedPairsReset forgets the usable pair when the agent drops its pairs.
@@ -388,7 +399,13 @@ func (a *Agent) spedDirectPairLocked() *CandidatePair {
 // receiveSPED runs the controller on the SPED attributes of a message and hands
 // embedded DTLS to the callback. It reports whether a datagram was delivered,
 // and whether spedEvaluateCompletion must run.
-func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate) (delivered, evaluate bool) {
+//
+// usable is the pair the message made the first usable pair, or nil. Once the
+// peer is known to support SPED, the datagrams still pending are sent directly
+// on it before the callback runs, as libwebrtc's FlushPendingDtlsPacket does
+// when ICE first becomes writable: the rest of a flight that needs several
+// messages then does not wait for the next checks.
+func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate, usable *CandidatePair) (delivered, evaluate bool) {
 	a.sped.mu.Lock()
 	callback := a.sped.callback
 	before := a.sped.ctrl.state
@@ -397,8 +414,13 @@ func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate) (delivered, 
 	)
 	a.spedUpdateLocked(before)
 	pair, packets := a.spedTakeFlushLocked()
+	var usablePackets []spedPacket
+	if usable != nil && a.spedDirectPairLocked() != nil {
+		usablePackets = slices.Clone(a.sped.ctrl.pending)
+	}
 	a.sped.mu.Unlock()
 	a.spedSend(pair, packets)
+	a.spedSend(usable, usablePackets)
 
 	if deliver {
 		callback(attrs.data, remote.addr())

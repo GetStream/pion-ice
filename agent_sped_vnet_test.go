@@ -160,8 +160,10 @@ func readDatagram(t *testing.T, conn *Conn, want []byte) {
 
 // TestSPEDLiteAndFull runs a simulated DTLS 1.3 handshake with a post-quantum
 // ClientHello in two datagrams between a full agent (ICE controlling, DTLS
-// client) and a lite agent (ICE controlled, DTLS server), entirely inside
-// STUN: neither side writes DTLS directly.
+// client) and a lite agent (ICE controlled, DTLS server), inside STUN. The
+// only DTLS that may be written directly is the second ClientHello datagram:
+// the full agent flushes it when its first check is answered, unless a second
+// check already carried it.
 func TestSPEDLiteAndFull(t *testing.T) {
 	defer test.CheckRoutines(t)()
 	defer test.TimeOut(30 * time.Second).Stop()
@@ -208,17 +210,64 @@ func TestSPEDLiteAndFull(t *testing.T) {
 		require.True(t, client.got(datagram))
 	}
 
-	// Completed by acknowledgements, with nothing left to send directly and
-	// nothing sent directly.
+	// Completed by acknowledgements, with nothing left to send directly.
 	require.Zero(t, spedPendingLen(agents.full))
 	require.Zero(t, spedPendingLen(agents.lite))
-	require.Zero(t, spedPacketsSent(agents.full))
+	require.LessOrEqual(t, spedPacketsSent(agents.full), uint32(1))
 	require.Zero(t, spedPacketsSent(agents.lite))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	require.NoError(t, agents.full.AwaitConnect(ctx))
 	require.NoError(t, agents.lite.AwaitConnect(ctx))
+}
+
+// TestSPEDFlushOnFirstUsablePair checks that the datagrams still pending when
+// a pair first becomes usable are sent directly on it, as libwebrtc does when
+// ICE first becomes writable. The peers set no DTLS callback, so embedded
+// datagrams are not delivered, and a datagram can only reach the peer's Conn
+// directly.
+func TestSPEDFlushOnFirstUsablePair(t *testing.T) {
+	t.Run("Full", func(t *testing.T) {
+		defer test.CheckRoutines(t)()
+		defer test.TimeOut(30 * time.Second).Stop()
+
+		// The checks sent before the first response carry, and implicitly
+		// acknowledge, the first datagrams; the flush sends the rest.
+		var flight [][]byte
+		for i := range 6 {
+			flight = append(flight, spedDatagram(100, byte(0xa0+i)))
+		}
+		agents := newSPEDVNetAgents(t)
+		defer agents.close(t)
+		require.NoError(t, agents.full.EnableSPED())
+		require.NoError(t, agents.lite.EnableSPED())
+		require.True(t, agents.full.Piggyback(flight))
+
+		_, liteConn := agents.start(t)
+		readDatagram(t, liteConn, flight[len(flight)-1])
+		require.Equal(t, SPEDStateConfirmed, agents.full.SPEDState())
+	})
+
+	t.Run("Lite", func(t *testing.T) {
+		defer test.CheckRoutines(t)()
+		defer test.TimeOut(30 * time.Second).Stop()
+
+		// The first check arrives before any datagram was sent, so the whole
+		// flight is flushed.
+		flight := [][]byte{spedDatagram(300, 0xa1), spedDatagram(300, 0xa2)}
+		agents := newSPEDVNetAgents(t)
+		defer agents.close(t)
+		require.NoError(t, agents.full.EnableSPED())
+		require.NoError(t, agents.lite.EnableSPED())
+		require.True(t, agents.lite.Piggyback(flight))
+
+		fullConn, _ := agents.start(t)
+		for _, datagram := range flight {
+			readDatagram(t, fullConn, datagram)
+		}
+		require.Equal(t, SPEDStateConfirmed, agents.lite.SPEDState())
+	})
 }
 
 // TestSPEDFallback connects an agent with SPED to one without: SPED turns off
