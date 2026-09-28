@@ -55,6 +55,9 @@ var (
 	// ErrMultipleStart indicates agent was started twice.
 	ErrMultipleStart = errors.New("attempted to start agent twice")
 
+	// ErrSPEDAfterStart indicates SPED was enabled after connectivity checks started.
+	ErrSPEDAfterStart = errors.New("SPED must be enabled before connectivity checks start")
+
 	// ErrRemoteUfragEmpty indicates agent was started with an empty remote ufrag.
 	ErrRemoteUfragEmpty = errors.New("remote ufrag is empty")
 

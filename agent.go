@@ -39,6 +39,9 @@ type bindingRequest struct {
 	isControlling   bool        // Role advertised in this request.
 	isUseCandidate  bool
 	nominationValue *uint32 // Tracks nomination value for renomination requests
+	spedSent        bool    // The request carried SPED attributes.
+	spedDataSent    bool    // The request carried a DTLS-in-STUN attribute.
+	spedDataCRC     uint32  // CRC-32 of that DTLS datagram.
 }
 
 // Agent represents the ICE agent.
@@ -188,6 +191,9 @@ type Agent struct {
 	lastRenominationTime  time.Time
 
 	turnClientFactory func(*turn.ClientConfig) (turnClient, error)
+
+	// DTLS handshake embedded in STUN (SPED), off unless EnableSPED is called.
+	sped spedSession
 }
 
 // NewAgent creates a new Agent.
@@ -782,6 +788,8 @@ func (a *Agent) setSelectedPair(pair *CandidatePair) {
 	pair.nominated = true
 	a.selectedPair.Store(pair)
 	a.log.Tracef("Set selected candidate pair: %s", pair)
+
+	a.spedPairSelected()
 
 	// Signal connected: notify any Connect() calls waiting on onConnected
 	a.onConnectedOnce.Do(func() { close(a.onConnected) })
@@ -1691,7 +1699,7 @@ func (a *Agent) sendBindingRequest(msg *stun.Message, local, remote Candidate) {
 	}
 
 	a.invalidatePendingBindingRequests(time.Now())
-	a.pendingBindingRequests = append(a.pendingBindingRequests, bindingRequest{
+	request := bindingRequest{
 		timestamp:       time.Now(),
 		transactionID:   msg.TransactionID,
 		destination:     remote.addrPort(),
@@ -1699,7 +1707,9 @@ func (a *Agent) sendBindingRequest(msg *stun.Message, local, remote Candidate) {
 		isControlling:   msg.Contains(stun.AttrICEControlling),
 		isUseCandidate:  msg.Contains(stun.AttrUseCandidate),
 		nominationValue: nominationValue,
-	})
+	}
+	a.spedRequestSent(msg, &request)
+	a.pendingBindingRequests = append(a.pendingBindingRequests, request)
 
 	if pair := a.findPair(local, remote); pair != nil {
 		pair.UpdateRequestSent()
@@ -1727,6 +1737,7 @@ func (a *Agent) sendBindingSuccess(m *stun.Message, local, remote Candidate) {
 			Port: port,
 		},
 	}
+	attributes = a.appendSPEDAttributes(attributes)
 	attributes = append(attributes,
 		stun.NewShortTermIntegrity(a.localPwd),
 		stun.Fingerprint)
@@ -1944,6 +1955,8 @@ func (a *Agent) handleInboundRequest(
 
 		return nil, false
 	}
+
+	a.handleSPEDRequest(msg, remoteCandidate)
 
 	a.getSelector().HandleBindingRequest(msg, local, remoteCandidate)
 
@@ -2297,6 +2310,7 @@ func (a *Agent) sendNominationRequest(pair *CandidatePair, nominationValue uint3
 		a.log.Tracef("Sending renomination request from %s to %s with nomination value %d",
 			pair.Local, pair.Remote, nominationValue)
 	}
+	attributes = a.appendSPEDAttributes(attributes)
 
 	attributes = append(attributes,
 		stun.NewShortTermIntegrity(a.remotePwd),

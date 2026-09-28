@@ -98,6 +98,7 @@ func (s *controllingSelector) nominatePair(pair *CandidatePair) {
 		AttrControlling(s.agent.tieBreaker),
 		PriorityAttr(pair.Local.Priority()),
 	}
+	attributes = s.agent.appendSPEDAttributes(attributes)
 	attributes = append(attributes,
 		stun.NewShortTermIntegrity(s.agent.remotePwd),
 		stun.Fingerprint)
@@ -163,11 +164,11 @@ func (a *Agent) handleBindingRequestWithCustomHandler(
 }
 
 func (s *controllingSelector) HandleSuccessResponse(
-	m *stun.Message, local, remote Candidate, remoteAddr netip.AddrPort,
+	message *stun.Message, local, remote Candidate, remoteAddr netip.AddrPort,
 ) {
-	ok, pendingRequest, rtt := s.agent.handleInboundBindingSuccess(m.TransactionID)
+	ok, pendingRequest, rtt := s.agent.handleInboundBindingSuccess(message.TransactionID)
 	if !ok {
-		s.log.Warnf("Discard success response from (%s), unknown TransactionID 0x%x", remote, m.TransactionID)
+		s.log.Warnf("Discard success response from (%s), unknown TransactionID 0x%x", remote, message.TransactionID)
 
 		return
 	}
@@ -193,6 +194,8 @@ func (s *controllingSelector) HandleSuccessResponse(
 
 		return
 	}
+
+	s.agent.handleSPEDResponse(message, pendingRequest, remote)
 
 	pair.state = CandidatePairStateSucceeded
 	s.log.Tracef("Found valid candidate pair: %s", pair)
@@ -223,6 +226,7 @@ func (s *controllingSelector) PingCandidate(local, remote Candidate) {
 		AttrControlling(s.agent.tieBreaker),
 		PriorityAttr(local.Priority()),
 	}
+	attributes = s.agent.appendSPEDAttributes(attributes)
 	attributes = append(attributes,
 		stun.NewShortTermIntegrity(s.agent.remotePwd),
 		stun.Fingerprint)
@@ -375,6 +379,7 @@ func (s *controlledSelector) PingCandidate(local, remote Candidate) {
 		AttrControlled(s.agent.tieBreaker),
 		PriorityAttr(local.Priority()),
 	}
+	attributes = s.agent.appendSPEDAttributes(attributes)
 	attributes = append(attributes,
 		stun.NewShortTermIntegrity(s.agent.remotePwd),
 		stun.Fingerprint)
@@ -390,7 +395,7 @@ func (s *controlledSelector) PingCandidate(local, remote Candidate) {
 }
 
 func (s *controlledSelector) HandleSuccessResponse(
-	m *stun.Message, local, remote Candidate, remoteAddr netip.AddrPort,
+	message *stun.Message, local, remote Candidate, remoteAddr netip.AddrPort,
 ) {
 	//nolint:godox
 	// TODO according to the standard we should specifically answer a failed nomination:
@@ -400,9 +405,9 @@ func (s *controlledSelector) HandleSuccessResponse(
 	// request with an appropriate error code response (e.g., 400)
 	// [RFC5389].
 
-	ok, pendingRequest, rtt := s.agent.handleInboundBindingSuccess(m.TransactionID)
+	ok, pendingRequest, rtt := s.agent.handleInboundBindingSuccess(message.TransactionID)
 	if !ok {
-		s.log.Warnf("Discard message from (%s), unknown TransactionID 0x%x", remote, m.TransactionID)
+		s.log.Warnf("Discard message from (%s), unknown TransactionID 0x%x", remote, message.TransactionID)
 
 		return
 	}
@@ -428,6 +433,8 @@ func (s *controlledSelector) HandleSuccessResponse(
 
 		return
 	}
+
+	s.agent.handleSPEDResponse(message, pendingRequest, remote)
 
 	pair.state = CandidatePairStateSucceeded
 	s.log.Tracef("Found valid candidate pair: %s", pair)
