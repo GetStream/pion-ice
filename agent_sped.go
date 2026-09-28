@@ -96,10 +96,10 @@ func (a *Agent) SetDTLSCallback(callback func(packet []byte, rAddr net.Addr)) {
 // not DTLS are skipped; the datagrams are copied.
 //
 // It returns false when the agent does not take the flight: SPED is disabled,
-// or SPED is complete or off and a candidate pair is selected. The caller then
-// sends the flight directly like any DTLS datagram. It returns true otherwise.
-// When SPED is complete or off and no pair is selected yet, the flight is held
-// and sent directly on the pair that gets selected.
+// or SPED is complete or off and WriteDTLS can send the flight directly. The
+// caller then sends it directly like any DTLS datagram. It returns true
+// otherwise. When SPED is complete or off and WriteDTLS has no pair yet, the
+// flight is held and sent directly on the pair that gets selected.
 //
 // While SPED is active the caller should also write the flight with
 // WriteDTLS, which succeeds once a pair is usable: the peer then gets it
@@ -115,7 +115,7 @@ func (a *Agent) Piggyback(flight [][]byte) bool {
 	case SPEDStateDisabled:
 		return false
 	case SPEDStateComplete, SPEDStateOff:
-		if a.getSelectedPair() != nil {
+		if a.getSelectedPair() != nil || a.spedDirectPairLocked() != nil {
 			return false
 		}
 	default:

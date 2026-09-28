@@ -897,6 +897,11 @@ func TestSPEDWriteDTLS(t *testing.T) {
 		require.Equal(t, SPEDStateComplete, env.agent.SPEDState())
 		require.Nil(t, env.agent.getSelectedPair())
 		require.Equal(t, [][]byte{spedFlight4}, env.conn.take())
+
+		// Later flights go out with WriteDTLS on the same pair.
+		require.False(t, env.agent.Piggyback([][]byte{spedFlight4}))
+		_, err := env.agent.WriteDTLS(spedFlight4)
+		require.NoError(t, err)
 	})
 }
 
