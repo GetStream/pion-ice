@@ -193,7 +193,8 @@ type Agent struct {
 	turnClientFactory func(*turn.ClientConfig) (turnClient, error)
 
 	// DTLS handshake embedded in STUN (SPED), off unless EnableSPED is called.
-	sped spedSession
+	sped      spedSession
+	spedCheck chan struct{}
 }
 
 // NewAgent creates a new Agent.
@@ -369,6 +370,7 @@ func createAgentBase(config *AgentConfig) (*Agent, error) {
 		mDNSName:                        mDNSName,
 		gatherCandidateCancel:           func() {},
 		forceCandidateContact:           make(chan bool, 1),
+		spedCheck:                       make(chan struct{}, 1),
 		interfaceFilter:                 config.InterfaceFilter,
 		ipFilter:                        config.IPFilter,
 		remoteIPFilter:                  config.RemoteIPFilter,
@@ -663,6 +665,9 @@ func (a *Agent) startConnectivityChecks(isControlling bool, remoteUfrag, remoteP
 
 		a.requestConnectivityCheck()
 		go a.connectivityChecks() //nolint:contextcheck
+		if a.sped.load() != SPEDStateDisabled && !a.lite {
+			go a.spedChecks() //nolint:contextcheck
+		}
 	})
 }
 

@@ -4,6 +4,7 @@
 package ice
 
 import (
+	"context"
 	"encoding/binary"
 	"hash/crc32"
 	"net"
@@ -102,7 +103,8 @@ func (a *Agent) SetDTLSCallback(callback func(packet []byte, rAddr net.Addr)) {
 //
 // While SPED is active the caller should also write the flight with
 // WriteDTLS, which succeeds once a pair is usable: the peer then gets it
-// directly as well as in STUN, as libwebrtc does.
+// directly as well as in STUN, as libwebrtc does. A full agent also sends a
+// check on the selected pair, or the best valid pair, for the flight to ride.
 //
 // It may be called from the DTLS callback.
 func (a *Agent) Piggyback(flight [][]byte) bool {
@@ -117,6 +119,7 @@ func (a *Agent) Piggyback(flight [][]byte) bool {
 			return false
 		}
 	default:
+		a.requestSPEDCheck()
 	}
 	a.sped.ctrl.capture(flight)
 
@@ -125,7 +128,8 @@ func (a *Agent) Piggyback(flight [][]byte) bool {
 
 // ReportDTLSPacket reports a DTLS datagram received directly, outside STUN,
 // so that its CRC-32 is acknowledged to the peer. Datagrams received in STUN
-// are acknowledged by the agent itself.
+// are acknowledged by the agent itself. A full agent sends a check to carry a
+// new acknowledgement.
 func (a *Agent) ReportDTLSPacket(packet []byte) {
 	if !a.spedActive() {
 		return
@@ -133,7 +137,9 @@ func (a *Agent) ReportDTLSPacket(packet []byte) {
 
 	a.sped.mu.Lock()
 	defer a.sped.mu.Unlock()
-	a.sped.ctrl.reportDTLSPacket(packet)
+	if a.sped.ctrl.reportDTLSPacket(packet) {
+		a.requestSPEDCheck()
+	}
 }
 
 // SetDTLSHandshakeComplete reports that the local DTLS handshake completed.
@@ -322,7 +328,10 @@ func (a *Agent) handleSPEDResponse(msg *stun.Message, request *bindingRequest, p
 		attrs.acks = append(attrs.acks, request.spedDataCRC)
 		attrs.ackValid = true
 	}
-	a.receiveSPED(attrs, pair.Remote)
+	if a.receiveSPED(attrs, pair.Remote) {
+		// Acknowledge the datagram without waiting for the next check.
+		a.requestSPEDCheck()
+	}
 }
 
 // spedPairUsable records that DTLS may be written directly on pair before a
@@ -361,8 +370,9 @@ func (a *Agent) spedDirectPairLocked() *CandidatePair {
 }
 
 // receiveSPED runs the controller on the SPED attributes of a message, hands
-// embedded DTLS to the callback, then evaluates completion.
-func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate) {
+// embedded DTLS to the callback, then evaluates completion. It reports whether
+// a datagram was delivered.
+func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate) bool {
 	a.sped.mu.Lock()
 	callback := a.sped.callback
 	before := a.sped.ctrl.state
@@ -378,7 +388,7 @@ func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate) {
 		callback(attrs.data, remote.addr())
 	}
 	if !evaluate {
-		return
+		return deliver
 	}
 
 	a.sped.mu.Lock()
@@ -388,6 +398,55 @@ func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate) {
 	pair, packets = a.spedTakeFlushLocked()
 	a.sped.mu.Unlock()
 	a.spedSend(pair, packets)
+
+	return deliver
+}
+
+// requestSPEDCheck asks a full agent for a check on the selected pair, or the
+// best valid pair, so that a queued flight or a new acknowledgement rides it
+// without waiting for the next scheduled check or keepalive. Once a pair is
+// selected checks only run every keepalive interval, and the DTLS handshake
+// would otherwise wait for that or for a DTLS retransmission. Lite agents do
+// not send checks. Requests are coalesced; it never blocks.
+func (a *Agent) requestSPEDCheck() {
+	if a.lite {
+		return
+	}
+	select {
+	case a.spedCheck <- struct{}{}:
+	default:
+	}
+}
+
+// spedChecks sends the checks requested by requestSPEDCheck until the agent
+// closes. It runs for full agents with SPED enabled.
+func (a *Agent) spedChecks() {
+	for {
+		select {
+		case <-a.spedCheck:
+			if err := a.loop.Run(a.loop, func(context.Context) { a.spedCheckNow() }); err != nil {
+				return
+			}
+		case <-a.loop.Done():
+			return
+		}
+	}
+}
+
+// spedCheckNow sends a check on the selected pair, or the best valid pair,
+// while SPED is active.
+func (a *Agent) spedCheckNow() {
+	if !a.spedActive() {
+		return
+	}
+	pair := a.getSelectedPair()
+	if pair == nil {
+		pair = a.getBestValidCandidatePair()
+	}
+	if pair == nil {
+		return
+	}
+	a.getSelector().PingCandidate(pair.Local, pair.Remote)
 }
 
 // spedPairSelected sends the datagrams held after SPED completed or turned off

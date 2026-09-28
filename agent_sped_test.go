@@ -11,6 +11,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pion/ice/v4/internal/fakenet"
 	"github.com/pion/stun/v4"
@@ -61,6 +62,8 @@ type spedTestConfig struct {
 	controlling bool
 	lite        bool
 	disabled    bool
+	// noChecks stops scheduled checks and keepalives.
+	noChecks bool
 }
 
 func newSPEDTestEnv(t *testing.T, cfg spedTestConfig) *spedTestEnv {
@@ -73,6 +76,13 @@ func newSPEDTestEnv(t *testing.T, cfg spedTestConfig) *spedTestEnv {
 	if cfg.lite {
 		agentConfig.Lite = true
 		agentConfig.CandidateTypes = []CandidateType{CandidateTypeHost}
+	}
+	if cfg.noChecks {
+		hour := time.Hour
+		agentConfig.CheckInterval = &hour
+		agentConfig.KeepaliveInterval = &hour
+		agentConfig.DisconnectedTimeout = &hour
+		agentConfig.FailedTimeout = &hour
 	}
 	agent, err := NewAgent(agentConfig)
 	require.NoError(t, err)
@@ -884,5 +894,96 @@ func TestSPEDWriteDTLS(t *testing.T) {
 		require.Equal(t, SPEDStateComplete, env.agent.SPEDState())
 		require.Nil(t, env.agent.getSelectedPair())
 		require.Equal(t, [][]byte{spedFlight4}, env.conn.take())
+	})
+}
+
+func TestSPEDTriggeredChecks(t *testing.T) {
+	// start starts the agent, waits for its initial check, then makes the pair
+	// valid, as a success response would.
+	start := func(t *testing.T, env *spedTestEnv) {
+		t.Helper()
+
+		var err error
+		if env.agent.isControlling.Load() {
+			_, err = env.agent.StartDial(spedTestRemoteUfrag, spedTestRemotePwd)
+		} else {
+			_, err = env.agent.StartAccept(spedTestRemoteUfrag, spedTestRemotePwd)
+		}
+		require.NoError(t, err)
+		if !env.agent.lite {
+			require.Eventually(t, func() bool {
+				env.conn.mu.Lock()
+				defer env.conn.mu.Unlock()
+
+				return len(env.conn.written) > 0
+			}, 5*time.Second, time.Millisecond)
+		}
+		env.run(t, func() {
+			pair := env.agent.findPair(env.local, env.remote)
+			pair.state = CandidatePairStateSucceeded
+			// Keep the controlling agent from nominating it.
+			env.agent.hostAcceptanceMinWait = time.Hour
+		})
+		env.conn.take()
+	}
+	// nextRequest waits for the next Binding request the agent writes.
+	nextRequest := func(t *testing.T, env *spedTestEnv) *stun.Message {
+		t.Helper()
+
+		var request *stun.Message
+		require.Eventually(t, func() bool {
+			for _, msg := range env.stunMessages(t) {
+				if msg.Type == stun.BindingRequest {
+					request = msg
+
+					return true
+				}
+			}
+
+			return false
+		}, 5*time.Second, time.Millisecond)
+
+		return request
+	}
+
+	for _, controlling := range []bool{true, false} {
+		t.Run(map[bool]string{true: "Controlling", false: "Controlled"}[controlling], func(t *testing.T) {
+			env := newSPEDTestEnv(t, spedTestConfig{controlling: controlling, noChecks: true})
+			env.agent.SetDTLSCallback(func([]byte, net.Addr) {})
+			start(t, env)
+
+			require.True(t, env.agent.Piggyback([][]byte{spedFlight3}))
+			request := nextRequest(t, env)
+			require.False(t, request.Contains(stun.AttrUseCandidate))
+			require.Equal(t, spedFlight3, spedAttributesFrom(request).data)
+
+			env.agent.ReportDTLSPacket(spedFlight4)
+			request = nextRequest(t, env)
+			require.Equal(t, crcs(spedFlight4), spedAttributesFrom(request).acks)
+
+			// A datagram received in a response is acknowledged right away.
+			env.deliverResponse(t, request, DtlsInStunAckAttribute{}, DtlsInStunAttribute(spedFlight2))
+			request = nextRequest(t, env)
+			require.Equal(t, crcs(spedFlight4, spedFlight2), spedAttributesFrom(request).acks)
+		})
+	}
+
+	t.Run("NotAfterCompletion", func(t *testing.T) {
+		env := newSPEDTestEnv(t, spedTestConfig{controlling: true, noChecks: true})
+		start(t, env)
+		env.agent.SetDTLSFailed()
+
+		require.True(t, env.agent.Piggyback([][]byte{spedFlight3}))
+		env.agent.ReportDTLSPacket(spedFlight4)
+		require.Never(t, func() bool { return len(env.conn.take()) > 0 }, 100*time.Millisecond, 5*time.Millisecond)
+	})
+
+	t.Run("NotForLiteAgents", func(t *testing.T) {
+		env := newSPEDTestEnv(t, spedTestConfig{lite: true, noChecks: true})
+		start(t, env)
+
+		require.True(t, env.agent.Piggyback([][]byte{spedFlight2}))
+		env.agent.ReportDTLSPacket(spedFlight1)
+		require.Never(t, func() bool { return len(env.conn.take()) > 0 }, 100*time.Millisecond, 5*time.Millisecond)
 	})
 }
