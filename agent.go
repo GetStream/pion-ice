@@ -1962,9 +1962,11 @@ func (a *Agent) handleInboundRequest(
 		return nil, false
 	}
 
-	a.handleSPEDRequest(msg, local, remoteCandidate)
+	spedEvaluate := a.handleSPEDRequest(msg, local, remoteCandidate)
 
 	a.getSelector().HandleBindingRequest(msg, local, remoteCandidate)
+
+	a.spedRequestHandled(spedEvaluate)
 
 	return remoteCandidate, true
 }

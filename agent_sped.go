@@ -294,10 +294,11 @@ func (a *Agent) spedRequestSent(msg *stun.Message, request *bindingRequest) {
 
 // handleSPEDRequest processes the SPED attributes of an authenticated Binding
 // request. It runs before the response is built, so that a flight queued by
-// the DTLS callback rides the response.
-func (a *Agent) handleSPEDRequest(msg *stun.Message, local, remote Candidate) {
+// the DTLS callback rides the response. Its result goes to spedRequestHandled
+// once the response is sent.
+func (a *Agent) handleSPEDRequest(msg *stun.Message, local, remote Candidate) bool {
 	if !a.spedActive() {
-		return
+		return false
 	}
 	if a.lite && !a.isControlling.Load() {
 		// The controlled selector adds the pair for this request anyway;
@@ -308,7 +309,9 @@ func (a *Agent) handleSPEDRequest(msg *stun.Message, local, remote Candidate) {
 		}
 		a.spedPairUsable(pair)
 	}
-	a.receiveSPED(spedAttributesFrom(msg), remote)
+	_, evaluate := a.receiveSPED(spedAttributesFrom(msg), remote)
+
+	return evaluate
 }
 
 // handleSPEDResponse processes the SPED attributes of a Binding success
@@ -328,9 +331,22 @@ func (a *Agent) handleSPEDResponse(msg *stun.Message, request *bindingRequest, p
 		attrs.acks = append(attrs.acks, request.spedDataCRC)
 		attrs.ackValid = true
 	}
-	if a.receiveSPED(attrs, pair.Remote) {
+	delivered, evaluate := a.receiveSPED(attrs, pair.Remote)
+	if evaluate {
+		a.spedEvaluateCompletion()
+	}
+	if delivered {
 		// Acknowledge the datagram without waiting for the next check.
 		a.requestSPEDCheck()
+	}
+}
+
+// spedRequestHandled evaluates completion after the response to a request
+// with SPED attributes was sent, so that the response still acknowledges the
+// peer's last flight and the peer can complete too.
+func (a *Agent) spedRequestHandled(evaluate bool) {
+	if evaluate {
+		a.spedEvaluateCompletion()
 	}
 }
 
@@ -369,10 +385,10 @@ func (a *Agent) spedDirectPairLocked() *CandidatePair {
 	}
 }
 
-// receiveSPED runs the controller on the SPED attributes of a message, hands
-// embedded DTLS to the callback, then evaluates completion. It reports whether
-// a datagram was delivered.
-func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate) bool {
+// receiveSPED runs the controller on the SPED attributes of a message and hands
+// embedded DTLS to the callback. It reports whether a datagram was delivered,
+// and whether spedEvaluateCompletion must run.
+func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate) (delivered, evaluate bool) {
 	a.sped.mu.Lock()
 	callback := a.sped.callback
 	before := a.sped.ctrl.state
@@ -387,19 +403,20 @@ func (a *Agent) receiveSPED(attrs spedAttributes, remote Candidate) bool {
 	if deliver {
 		callback(attrs.data, remote.addr())
 	}
-	if !evaluate {
-		return deliver
-	}
 
+	return deliver, evaluate
+}
+
+// spedEvaluateCompletion completes SPED once the local handshake is complete
+// and every pending datagram is acknowledged.
+func (a *Agent) spedEvaluateCompletion() {
 	a.sped.mu.Lock()
-	before = a.sped.ctrl.state
+	before := a.sped.ctrl.state
 	a.sped.ctrl.evaluateCompletion()
 	a.spedUpdateLocked(before)
-	pair, packets = a.spedTakeFlushLocked()
+	pair, packets := a.spedTakeFlushLocked()
 	a.sped.mu.Unlock()
 	a.spedSend(pair, packets)
-
-	return deliver
 }
 
 // requestSPEDCheck asks a full agent for a check on the selected pair, or the

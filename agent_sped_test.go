@@ -682,8 +682,11 @@ func TestSPEDCompletion(t *testing.T) {
 		env.deliverRequest(t)
 		require.Equal(t, SPEDStatePending, env.agent.SPEDState())
 
+		env.conn.take()
 		env.deliverRequest(t, DtlsInStunAckAttribute(crcs(spedFlight3)))
 		require.Equal(t, SPEDStateComplete, env.agent.SPEDState())
+		// The response to the completing request still carries the ACK list.
+		require.True(t, env.response(t).Contains(stun.AttrDtlsInStunAck))
 
 		// No SPED attribute any more.
 		request := env.ping(t)
@@ -986,4 +989,32 @@ func TestSPEDTriggeredChecks(t *testing.T) {
 		env.agent.ReportDTLSPacket(spedFlight1)
 		require.Never(t, func() bool { return len(env.conn.take()) > 0 }, 100*time.Millisecond, 5*time.Millisecond)
 	})
+}
+
+// TestSPEDLastFlightAcknowledged checks that the response to the request that
+// carries the peer's last flight acknowledges it, although that request
+// completes SPED, so that the peer completes without application data.
+func TestSPEDLastFlightAcknowledged(t *testing.T) {
+	env := newSPEDTestEnv(t, spedTestConfig{lite: true})
+	env.agent.SetDTLSCallback(func(packet []byte, _ net.Addr) {
+		if string(packet) == string(spedFlight1) {
+			require.True(t, env.agent.Piggyback([][]byte{spedFlight2}))
+		} else {
+			// The client Finished completes the DTLS 1.3 server.
+			env.agent.SetDTLSHandshakeComplete()
+		}
+	})
+
+	env.deliverRequest(t, DtlsInStunAckAttribute{}, DtlsInStunAttribute(spedFlight1))
+	require.Equal(t, spedFlight2, spedAttributesFrom(env.response(t)).data)
+
+	env.deliverRequest(t, DtlsInStunAckAttribute(crcs(spedFlight2)), DtlsInStunAttribute(spedFlight3))
+	require.Equal(t, SPEDStateComplete, env.agent.SPEDState())
+	attrs := spedAttributesFrom(env.response(t))
+	require.Equal(t, crcs(spedFlight1, spedFlight3), attrs.acks)
+	require.False(t, attrs.hasData)
+
+	// Later messages carry nothing.
+	env.deliverRequest(t)
+	require.False(t, env.response(t).Contains(stun.AttrDtlsInStunAck))
 }
