@@ -216,6 +216,14 @@ func (s *controllingSelector) HandleSuccessResponse(
 	}
 
 	pair.UpdateRoundTripTime(rtt)
+
+	// Nominate as soon as a check succeeds on a nominatable pair, instead of on the next
+	// connectivity check tick. A lite peer never sends checks of its own that would
+	// trigger it earlier, so without this nomination can wait up to a whole check interval.
+	if !pendingRequest.isUseCandidate && s.nominatedPair == nil && s.agent.getSelectedPair() == nil &&
+		s.isNominatable(pair.Local) && s.isNominatable(pair.Remote) {
+		s.agent.requestConnectivityCheck()
+	}
 }
 
 func (s *controllingSelector) PingCandidate(local, remote Candidate) {

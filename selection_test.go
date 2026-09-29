@@ -1689,6 +1689,57 @@ func TestLiteControlledSelector_NoPingCandidate(t *testing.T) {
 	})
 }
 
+// TestControllingNominatesOnFirstSuccessWithLitePeer connects a full controlling agent to
+// a lite agent, which never sends checks, with every periodic interval far longer than
+// the test. The controlling agent must nominate on the first successful check instead
+// of waiting for its next connectivity check tick.
+func TestControllingNominatesOnFirstSuccessWithLitePeer(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(time.Second * 30).Stop()
+
+	long := time.Hour
+	config := func(lite bool) *AgentConfig {
+		cfg := &AgentConfig{
+			NetworkTypes:        []NetworkType{NetworkTypeUDP4},
+			MulticastDNSMode:    MulticastDNSModeDisabled,
+			CheckInterval:       &long,
+			KeepaliveInterval:   &long,
+			DisconnectedTimeout: &long,
+			FailedTimeout:       &long,
+			Lite:                lite,
+		}
+		if lite {
+			cfg.CandidateTypes = []CandidateType{CandidateTypeHost}
+		}
+
+		return cfg
+	}
+
+	fullNotifier, fullConnected := onConnected()
+	fullAgent, err := NewAgent(config(false))
+	require.NoError(t, err)
+	require.NoError(t, fullAgent.OnConnectionStateChange(fullNotifier))
+	t.Cleanup(func() { require.NoError(t, fullAgent.Close()) })
+
+	liteNotifier, liteConnected := onConnected()
+	liteAgent, err := NewAgent(config(true))
+	require.NoError(t, err)
+	require.NoError(t, liteAgent.OnConnectionStateChange(liteNotifier))
+	t.Cleanup(func() { require.NoError(t, liteAgent.Close()) })
+
+	start := time.Now()
+	liteConn, fullConn := connect(t, liteAgent, fullAgent)
+	defer closePipe(t, liteConn, fullConn)
+	for _, connected := range []chan struct{}{fullConnected, liteConnected} {
+		select {
+		case <-connected:
+		case <-time.After(time.Second):
+			require.FailNow(t, "not connected within a second: nomination waited for a check tick")
+		}
+	}
+	require.Less(t, time.Since(start), time.Second)
+}
+
 // TestLiteMode_FullToLite_Integration is an end-to-end test for the most common
 // lite mode deployment: a full ICE agent (controlling) connects to a lite agent
 // (controlled). The full agent performs connectivity checks and nominates; the
