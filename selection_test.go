@@ -1740,6 +1740,84 @@ func TestControllingNominatesOnFirstSuccessWithLitePeer(t *testing.T) {
 	require.Less(t, time.Since(start), time.Second)
 }
 
+// TestControllingNominatesInFirstCheckWithLitePeer connects a full controlling agent to a
+// lite agent over a network with a 50 ms one-way delay. The first check nominates, so both
+// agents connect one round trip after the full agent starts checking, not two.
+func TestControllingNominatesInFirstCheckWithLitePeer(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(time.Second * 30).Stop()
+
+	const oneWay = 50 * time.Millisecond
+	router, err := vnet.NewRouter(&vnet.RouterConfig{
+		CIDR:          "10.0.0.0/24",
+		MinDelay:      oneWay,
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	require.NoError(t, err)
+	newNet := func(ip string) *vnet.Net {
+		n, netErr := vnet.NewNet(&vnet.NetConfig{StaticIPs: []string{ip}})
+		require.NoError(t, netErr)
+		require.NoError(t, router.AddNet(n))
+
+		return n
+	}
+	fullNet, liteNet := newNet("10.0.0.1"), newNet("10.0.0.2")
+	require.NoError(t, router.Start())
+	defer func() { require.NoError(t, router.Stop()) }()
+
+	long := time.Hour
+	config := func(lite bool, n *vnet.Net) *AgentConfig {
+		return &AgentConfig{
+			NetworkTypes:        []NetworkType{NetworkTypeUDP4},
+			CandidateTypes:      []CandidateType{CandidateTypeHost},
+			MulticastDNSMode:    MulticastDNSModeDisabled,
+			CheckInterval:       &long,
+			KeepaliveInterval:   &long,
+			DisconnectedTimeout: &long,
+			FailedTimeout:       &long,
+			Lite:                lite,
+			Net:                 n,
+		}
+	}
+	fullAgent, err := NewAgent(config(false, fullNet))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, fullAgent.Close()) }()
+	liteAgent, err := NewAgent(config(true, liteNet))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, liteAgent.Close()) }()
+	require.NoError(t, fullAgent.SetRemoteICELite(true))
+
+	liteNotifier, liteConnected := onConnected()
+	require.NoError(t, liteAgent.OnConnectionStateChange(liteNotifier))
+	gatherAndExchangeCandidates(t, liteAgent, fullAgent)
+	liteUfrag, litePwd, err := liteAgent.GetLocalUserCredentials()
+	require.NoError(t, err)
+	fullUfrag, fullPwd, err := fullAgent.GetLocalUserCredentials()
+	require.NoError(t, err)
+
+	accepted := make(chan *Conn, 1)
+	go func() {
+		conn, acceptErr := liteAgent.Accept(context.Background(), fullUfrag, fullPwd)
+		assert.NoError(t, acceptErr)
+		accepted <- conn
+	}()
+	start := time.Now()
+	fullConn, err := fullAgent.Dial(context.Background(), liteUfrag, litePwd)
+	require.NoError(t, err)
+	fullElapsed := time.Since(start)
+	<-liteConnected
+	liteConn := <-accepted
+	defer closePipe(t, liteConn, fullConn)
+
+	rtt := 2 * oneWay
+	require.Less(t, fullElapsed, rtt*3/2, "the full agent connected after %v: nomination took its own check", fullElapsed)
+	require.NoError(t, fullAgent.loop.Run(fullAgent.loop, func(context.Context) {
+		selector, ok := fullAgent.getSelector().(*controllingSelector)
+		require.True(t, ok)
+		require.Nil(t, selector.nominatedPair, "a separate nomination was sent after the first check")
+	}))
+}
+
 // TestLiteMode_FullToLite_Integration is an end-to-end test for the most common
 // lite mode deployment: a full ICE agent (controlling) connects to a lite agent
 // (controlled). The full agent performs connectivity checks and nominates; the
