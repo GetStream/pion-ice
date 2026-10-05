@@ -85,21 +85,6 @@ func (s *controllingSelector) ContactCandidates() {
 	}
 }
 
-// nominatesOnCheck reports whether a check on the pair also nominates it. A lite peer puts a
-// nominated pair in its valid list on receipt (RFC 8445 Section 7.3.2) and never checks back,
-// so nominating in the check itself saves the round trip of a separate nomination. Only the
-// best nominatable pair is nominated this way, and only until a pair is nominated or selected;
-// the pair is not recorded as nominated, so a check that fails leaves regular nomination as is.
-func (s *controllingSelector) nominatesOnCheck(local, remote Candidate) bool {
-	if !s.agent.remoteLite || s.nominatedPair != nil || s.agent.getSelectedPair() != nil ||
-		!s.isNominatable(local) || !s.isNominatable(remote) {
-		return false
-	}
-	best := s.agent.getBestAvailableCandidatePair()
-
-	return best != nil && best.Local.Equal(local) && best.Remote.Equal(remote)
-}
-
 func (s *controllingSelector) nominatePair(pair *CandidatePair) {
 	// The controlling agent MUST include the USE-CANDIDATE attribute in
 	// order to nominate a candidate pair (Section 8.1.1).  The controlled
@@ -248,9 +233,6 @@ func (s *controllingSelector) PingCandidate(local, remote Candidate) {
 		stun.NewUsername(s.agent.remoteUfrag + ":" + s.agent.localUfrag),
 		AttrControlling(s.agent.tieBreaker),
 		PriorityAttr(local.Priority()),
-	}
-	if s.nominatesOnCheck(local, remote) {
-		attributes = append(attributes, UseCandidate())
 	}
 	attributes = s.agent.appendSPEDAttributes(attributes)
 	attributes = append(attributes,
