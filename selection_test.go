@@ -1740,6 +1740,113 @@ func TestControllingNominatesOnFirstSuccessWithLitePeer(t *testing.T) {
 	require.Less(t, time.Since(start), time.Second)
 }
 
+// TestControllingConvergesWithLitePeerWhenBestPairIsOneWay connects a full controlling agent
+// to a lite agent with two host addresses. Binding responses from the lite agent's
+// higher-priority address are dropped, so checks reach the lite agent on that pair but never
+// succeed. Both agents must select the same, working pair. Nominating the best pair before its
+// check succeeded (aggressive nomination, which RFC 5245 Section 8.1.1 forbids toward a lite
+// peer) made a lite agent with EnableUseCandidateCheckPriority keep the one-way pair while the
+// full agent selected the other one.
+func TestControllingConvergesWithLitePeerWhenBestPairIsOneWay(t *testing.T) {
+	for _, checkPriority := range []bool{false, true} {
+		t.Run(fmt.Sprintf("EnableUseCandidateCheckPriority=%v", checkPriority), func(t *testing.T) {
+			defer test.CheckRoutines(t)()
+			defer test.TimeOut(time.Second * 30).Stop()
+
+			router, err := vnet.NewRouter(&vnet.RouterConfig{
+				CIDR:          "10.0.0.0/24",
+				LoggerFactory: logging.NewDefaultLoggerFactory(),
+			})
+			require.NoError(t, err)
+			newNet := func(ips ...string) *vnet.Net {
+				n, netErr := vnet.NewNet(&vnet.NetConfig{StaticIPs: ips})
+				require.NoError(t, netErr)
+				require.NoError(t, router.AddNet(n))
+
+				return n
+			}
+			fullNet, liteNet := newNet("10.0.0.1"), newNet("10.0.0.2", "10.0.0.3")
+			require.NoError(t, router.Start())
+			defer func() { require.NoError(t, router.Stop()) }()
+
+			long := time.Hour
+			config := func(lite bool, n *vnet.Net) *AgentConfig {
+				return &AgentConfig{
+					NetworkTypes:                    []NetworkType{NetworkTypeUDP4},
+					CandidateTypes:                  []CandidateType{CandidateTypeHost},
+					MulticastDNSMode:                MulticastDNSModeDisabled,
+					KeepaliveInterval:               &long,
+					DisconnectedTimeout:             &long,
+					FailedTimeout:                   &long,
+					Lite:                            lite,
+					EnableUseCandidateCheckPriority: lite && checkPriority,
+					Net:                             n,
+				}
+			}
+			fullAgent, err := NewAgent(config(false, fullNet))
+			require.NoError(t, err)
+			defer func() { require.NoError(t, fullAgent.Close()) }()
+			liteAgent, err := NewAgent(config(true, liteNet))
+			require.NoError(t, err)
+			defer func() { require.NoError(t, liteAgent.Close()) }()
+			require.NoError(t, fullAgent.SetRemoteICELite(true))
+
+			gatherAndExchangeCandidates(t, liteAgent, fullAgent)
+			liteCandidates, err := liteAgent.GetLocalCandidates()
+			require.NoError(t, err)
+			require.Len(t, liteCandidates, 2)
+			oneWay := liteCandidates[0]
+			if liteCandidates[1].Priority() > oneWay.Priority() {
+				oneWay = liteCandidates[1]
+			}
+			var dropped atomic.Int32
+			router.AddChunkFilter(func(c vnet.Chunk) bool {
+				src, ok := c.SourceAddr().(*net.UDPAddr)
+				if !ok || src.IP.String() != oneWay.Address() || !stun.IsMessage(c.UserData()) {
+					return true
+				}
+				msg := &stun.Message{Raw: append([]byte(nil), c.UserData()...)}
+				if msg.Decode() != nil || msg.Type != stun.BindingSuccess {
+					return true
+				}
+				dropped.Add(1)
+
+				return false
+			})
+
+			liteNotifier, liteConnected := onConnected()
+			require.NoError(t, liteAgent.OnConnectionStateChange(liteNotifier))
+			liteUfrag, litePwd, err := liteAgent.GetLocalUserCredentials()
+			require.NoError(t, err)
+			fullUfrag, fullPwd, err := fullAgent.GetLocalUserCredentials()
+			require.NoError(t, err)
+
+			accepted := make(chan *Conn, 1)
+			go func() {
+				conn, acceptErr := liteAgent.Accept(context.Background(), fullUfrag, fullPwd)
+				assert.NoError(t, acceptErr)
+				accepted <- conn
+			}()
+			fullConn, err := fullAgent.Dial(context.Background(), liteUfrag, litePwd)
+			require.NoError(t, err)
+			<-liteConnected
+			liteConn := <-accepted
+			defer closePipe(t, liteConn, fullConn)
+
+			require.Positive(t, dropped.Load(), "no response from the one-way address was dropped")
+			fullPair, err := fullAgent.GetSelectedCandidatePair()
+			require.NoError(t, err)
+			require.NotEqual(t, oneWay.Address(), fullPair.Remote.Address())
+			require.Eventually(t, func() bool {
+				litePair, pairErr := liteAgent.GetSelectedCandidatePair()
+
+				return pairErr == nil && litePair != nil && litePair.Local.Equal(fullPair.Remote) &&
+					litePair.Remote.Equal(fullPair.Local)
+			}, 5*time.Second, 20*time.Millisecond, "the lite agent did not select the full agent's pair")
+		})
+	}
+}
+
 // TestLiteMode_FullToLite_Integration is an end-to-end test for the most common
 // lite mode deployment: a full ICE agent (controlling) connects to a lite agent
 // (controlled). The full agent performs connectivity checks and nominates; the
